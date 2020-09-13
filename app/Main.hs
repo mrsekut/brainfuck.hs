@@ -1,42 +1,59 @@
 module Main where
 
+import           Control.Monad.State
 import           Data.Char
-import qualified Data.Map   as M
-import           Data.Maybe (fromJust)
+import qualified Data.Map            as M
+import           Data.Maybe          (fromJust)
+
+
+-- Instructions
+
+data BF = Next    -- >
+        | Prev    -- <
+        | Inc     -- +
+        | Dec     -- -
+        | Out     -- .
+        | In      -- ,
+        | LStart  -- [
+        | LEnd    -- ]
+        | Other
+        deriving (Show)
+
+
+-- | Env
 
 type Heap = [Int]
 type Ptr = Int
 type Idx = Int
-type Env = (Heap, Ptr, Idx)
+data Env = Env {
+  heap :: Heap,
+  ptr  :: Ptr,
+  idx  :: Idx
+} deriving (Show)
+
+prev, next :: Env -> Env
+prev env = env { ptr = ptr env - 1 }
+next env = env { ptr = ptr env + 1 }
+
+appCur :: (Int -> Int) -> Env -> Env
+appCur f env = env { heap = update env (f $ cur env)}
+
+cur :: Env -> Int
+cur env = heap env !! ptr env
+
+update :: Env -> Int -> Heap
+update env n = take ptr' heap' ++ [n] ++ drop (ptr' + 1) heap'
+  where
+    ptr' = ptr env
+    heap' = heap env
 
 
-
-main :: IO ()
-main = do
-  input <- readFile "example.bf"
-  let env = ([], 0, 0)
-  let bm = braceMap input
-  run input (return env) bm
-  print '\n'
-
-run :: [Char] -> IO Env -> BraceMap -> IO Env
-run input env bm = do
-  e <- env
-  if length input == thd e
-    then return e
-    else run input (cmd e (input !! thd e) bm) bm
-
-
+-- | BraceMap
 
 type Start = Int
 type End = Int
 type BraceMap = M.Map Start End
 type Stack = [Int]
-
-
-thd :: (a, b, c) -> c
-thd (a,b,c) = c
-
 
 braceMap :: String -> BraceMap
 braceMap input = makeStack input [] 0 M.empty
@@ -57,43 +74,90 @@ braceMap input = makeStack input [] 0 M.empty
     push a stack = stack ++ [a]
 
 
-cmd :: Env -> Char -> BraceMap -> IO Env
-cmd (heap, ptr, idx) '>' bm = return (heap, ptr+1, idx+1)
-cmd (heap, ptr, idx) '<' bm = return (heap, ptr-1, idx+1)
-cmd (heap, ptr, idx) '+' bm = return (incH heap ptr, ptr, idx+1)
-cmd (heap, ptr, idx) '-' bm = return (decH heap ptr, ptr, idx+1)
-cmd (heap, ptr, idx) '.' bm = do
-  putChar (toEnum (heap !! ptr) :: Char)
-  return (heap, ptr, idx+1)
-cmd (heap, ptr, idx) ',' bm = do
-  input <- getChar
-  return $ (update heap ptr (ord $ input), ptr, idx+1)
-cmd (heap, ptr, idx) '[' bm
-  | heap !! ptr == 0 = return (heap, ptr, fromJust $ M.lookup idx bm)
-  | otherwise = return (heap, ptr, idx+1)
-cmd (heap, ptr, idx) ']' bm
-  | heap !! ptr == 0 = return (heap, ptr, idx+1)
-  | otherwise = return (heap, ptr, fromJust $ M.lookup idx bm)
-cmd (heap, ptr, idx)  _  bm = return (heap, ptr+1, idx+1)
+-- | Parser
 
--- utils
+-- >>> parser "<]>.+"
+-- [Prev,LEnd,Next,Out,Inc]
+parser :: String -> [BF]
+parser []     = []
+parser (s:ss) = lexer s: parser ss
+  where
+    lexer :: Char -> BF
+    lexer '>' = Next
+    lexer '<' = Prev
+    lexer '+' = Inc
+    lexer '-' = Dec
+    lexer '.' = Out
+    lexer ',' = In
+    lexer '[' = LStart
+    lexer ']' = LEnd
+    lexer _   = Other
 
 
-incH :: Heap -> Ptr -> Heap
-incH [] ptr
-  | ptr == 0 = [1]
-  | otherwise = 0: incH [] (ptr - 1)
-incH (h:hs) ptr
-  | ptr == 0  = (h+1):hs
-  | otherwise = h: incH hs (ptr - 1)
+-- | Eval
+
+addIdx :: StateT Env IO ()
+addIdx = do
+  env <- get
+  put env { idx = idx env + 1}
+
+modifyIndex ::  (Env -> Env) -> StateT Env IO ()
+modifyIndex f = do
+  modify f
+  addIdx
+
+eval :: BF -> BraceMap -> StateT Env IO ()
+eval Next _    = modifyIndex next
+eval Prev _    = modifyIndex prev
+eval Inc  _    = modifyIndex $ appCur (+1)
+eval Dec  _    = modifyIndex $ appCur (subtract 1)
+eval Out  _    = do
+  liftIO . putChar . toEnum . cur =<< get
+  addIdx
+eval In   _    = do
+  input <- lift getChar
+  modifyIndex $ appCur (\_ -> ord input)
+eval LStart bm = do
+  env <- get
+  case cur env of
+    0 -> put env { idx = fromJust $ M.lookup (idx env) bm }
+    _ -> addIdx
+eval LEnd bm   = do
+  env <- get
+  case cur env of
+    0 -> addIdx
+    _ -> put env { idx = fromJust $ M.lookup (idx env) bm }
+eval Other _   = return ()
 
 
-decH :: Heap -> Ptr -> Heap
-decH [] ptr
-  | ptr == 0 = [-1]
-  | otherwise = -1: incH [] (ptr - 1)
-decH heap ptr = update heap ptr ((heap !! ptr) - 1)
+-- | Main
+
+main :: IO ((), Env)
+main = do
+  input <- readFile "example.bf"
+  let ast = parser input
+  -- let env = Env { heap = replicate 20 0, ptr = 0, idx = 0} -- for debug
+  let env = Env { heap = [0,0..], ptr = 0, idx = 0}
+  let bm = braceMap input
+  runStateT (run ast bm) env
 
 
-update :: Heap -> Ptr -> Int -> Heap
-update heap ptr a = take ptr heap ++ [a] ++ drop (ptr + 1) heap
+run :: [BF] -> BraceMap -> StateT Env IO ()
+run input bm = do
+  env <- get
+  let bf = input !! idx env
+  if length input == idx env
+    then put env
+    else do
+      eval bf bm
+      run input bm
+
+
+-- | Debug
+
+debug :: String -> StateT Env IO ()
+debug s = do
+  env <- get
+  liftIO $ print s
+  liftIO $ print env
+
